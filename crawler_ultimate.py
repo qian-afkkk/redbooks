@@ -295,7 +295,7 @@ class DatabaseManager:
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -315,10 +315,32 @@ class DatabaseManager:
                 video_url TEXT,
                 comments TEXT,
                 keyword TEXT,
-                crawl_time TEXT
+                crawl_time TEXT,
+                local_images TEXT,
+                local_video TEXT,
+                batch_dir TEXT,
+                image_count INTEGER DEFAULT 0
             )
         ''')
-        
+
+        # 检查并添加新列（用于旧数据库升级）
+        try:
+            cursor.execute("ALTER TABLE notes ADD COLUMN local_images TEXT")
+        except:
+            pass
+        try:
+            cursor.execute("ALTER TABLE notes ADD COLUMN local_video TEXT")
+        except:
+            pass
+        try:
+            cursor.execute("ALTER TABLE notes ADD COLUMN batch_dir TEXT")
+        except:
+            pass
+        try:
+            cursor.execute("ALTER TABLE notes ADD COLUMN image_count INTEGER DEFAULT 0")
+        except:
+            pass
+
         conn.commit()
         conn.close()
     
@@ -326,14 +348,20 @@ class DatabaseManager:
         """插入笔记"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         try:
+            # 处理 local_images - 转换为字符串存储
+            local_images = note_data.get('local_images', [])
+            if isinstance(local_images, list):
+                local_images = '|'.join(local_images) if local_images else ''
+
             cursor.execute('''
-                INSERT OR REPLACE INTO notes 
+                INSERT OR REPLACE INTO notes
                 (note_id, title, author, content, tags, publish_time, ip_region,
                  like_count, collect_count, comment_count, note_type, note_link,
-                 image_urls, video_url, comments, keyword, crawl_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 image_urls, video_url, comments, keyword, crawl_time,
+                 local_images, local_video, batch_dir, image_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 note_data.get('note_id', ''),
                 note_data.get('title', ''),
@@ -351,7 +379,11 @@ class DatabaseManager:
                 note_data.get('video_url', ''),
                 json.dumps(note_data.get('comments', []), ensure_ascii=False),
                 note_data.get('keyword', ''),
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                local_images,
+                note_data.get('local_video', ''),
+                note_data.get('batch_dir', ''),
+                note_data.get('image_count', 0)
             ))
             conn.commit()
             return True
@@ -519,7 +551,74 @@ class MediaDownloader:
     def reset_stats(self):
         """重置统计"""
         self._stats = {'success': 0, 'failed': 0, 'bytes': 0}
-    
+
+    def download_with_session(self, url: str, local_path: str, page) -> bool:
+        """使用浏览器session下载文件（支持需要认证的图片）"""
+        try:
+            url = self._normalize_url(url)
+            if not url:
+                return False
+
+            # 确保目录存在
+            os.makedirs(os.path.dirname(local_path), exist_ok=True)
+
+            # 方法1: 从浏览器获取Cookie，用requests下载
+            cookies = page.cookies()
+            if cookies:
+                # 更新session的cookies
+                for cookie in cookies:
+                    try:
+                        self.session.cookies.set(
+                            cookie.get('name', ''),
+                            cookie.get('value', ''),
+                            domain=cookie.get('domain', '.xiaohongshu.com')
+                        )
+                    except:
+                        pass
+
+            # 使用更新后的session下载
+            for attempt in range(self.retry_times):
+                try:
+                    response = self.session.get(url, timeout=self.timeout, stream=True)
+                    response.raise_for_status()
+
+                    # 确定文件扩展名
+                    content_type = response.headers.get('content-type', '')
+                    if 'webp' in content_type or '.webp' in url:
+                        ext = '.webp'
+                    elif 'png' in content_type:
+                        ext = '.png'
+                    else:
+                        ext = '.jpg'
+
+                    # 确保本地路径有正确的扩展名
+                    final_path = local_path
+                    if not final_path.endswith(ext):
+                        final_path = local_path.rsplit('.', 1)[0] + ext
+
+                    # 保存文件
+                    with open(final_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+
+                    self._stats['success'] += 1
+                    return True
+
+                except requests.Timeout:
+                    if attempt < self.retry_times - 1:
+                        time.sleep(0.2 * (attempt + 1))
+                except Exception:
+                    if attempt < self.retry_times - 1:
+                        time.sleep(0.1)
+
+            self._stats['failed'] += 1
+            return False
+
+        except Exception as e:
+            self._stats['failed'] += 1
+            return False
+
     def close(self):
         """关闭Session"""
         if self._session:
@@ -3008,7 +3107,7 @@ class CrawlerApp:
             data = getattr(self, 'history_notes_data', [])
         else:
             data = self.all_notes_data
-        
+
         if not data:
             messagebox.showwarning("提示", "没有数据可导出")
             return
@@ -4067,16 +4166,14 @@ class CrawlerApp:
                 consecutive_fails = 0
             
             try:
-                # 确保在目标页面
+                # 确保在目标页面（检查是否有笔记弹窗未关闭）
                 current_url = page.url or ""
-                if '/explore/' in current_url and 'xsec_token' in current_url:
-                    # 在笔记详情弹窗页，返回
-                    try:
-                        page.run_js("history.back()")
-                        time.sleep(0.5)
-                    except Exception:
-                        pass
-                
+                has_popup = page.ele('css:.note-detail-mask, .note-container', timeout=0.5)
+                if ('/explore/' in current_url and 'xsec_token' in current_url) or has_popup:
+                    # 在笔记详情弹窗页，关闭弹窗
+                    self._close_note_popup(page)
+                    time.sleep(0.5)
+
                 # 获取所有笔记元素
                 elements = page.eles("css:section.note-item", timeout=1)
                 if not elements:
@@ -4169,8 +4266,8 @@ class CrawlerApp:
                         if unavailable:
                             self.log("笔记无法浏览，跳过", "WARNING")
                             crawled_urls.add(note_id)
-                            page.run_js("history.back()")
-                            time.sleep(0.3)
+                            self._close_note_popup(page)
+                            time.sleep(0.5)
                             break  # 退出内层循环，继续外层循环
                     except Exception:
                         pass
@@ -4208,14 +4305,10 @@ class CrawlerApp:
                     else:
                         consecutive_fails += 1
                     
-                    # 返回列表页
-                    try:
-                        page.run_js("history.back()")
-                        time.sleep(0.4)
-                    except Exception:
-                        page.actions.key_down('Escape').key_up('Escape')
-                        time.sleep(0.3)
-                    
+                    # 返回列表页 - 关闭笔记详情弹窗
+                    self._close_note_popup(page)
+                    time.sleep(0.5)
+
                     break  # 成功处理一个笔记，退出内层循环
                 
                 # 如果没找到未爬取的笔记，尝试滚动加载更多
@@ -4244,12 +4337,13 @@ class CrawlerApp:
                 self.log(f"爬取失败: {error_msg}", "ERROR")
                 
                 # 尝试返回列表页
+                # 异常时也尝试关闭弹窗
                 try:
-                    page.run_js("history.back()")
+                    self._close_note_popup(page)
                     time.sleep(0.5)
                 except Exception:
                     pass
-        
+
         self.log(f"爬取完成：成功 {success} 个笔记", "SUCCESS")
         return success, images, videos
     
@@ -4822,6 +4916,7 @@ class CrawlerApp:
             data['video_url'] = video_url
             
             # 获取图片URL - 优先使用JavaScript从页面状态获取
+            self.log(f"  开始获取图片URL...", "DEBUG")
             preview_images = []
             try:
                 # 方法1: 从当前弹窗的DOM直接获取图片（最可靠）
@@ -4942,6 +5037,7 @@ class CrawlerApp:
                 
                 # 如果开启了获取全部图片，尝试切换轮播获取更多
                 if self.config.get_all_images and note_type != "视频":
+                    self.log(f"  开始轮播切换获取更多图片...", "DEBUG")
                     # 尝试多种方式切换轮播
                     max_clicks = 15  # 最多点击15次
                     for click_idx in range(max_clicks):
@@ -5004,22 +5100,33 @@ class CrawlerApp:
             if self.config.download_images and data['image_urls'] and note_type != "视频":
                 # 使用note_id命名文件夹，便于后续匹配数据库
                 folder = f"{images_dir}/note_{idx+1}_{note_id}" if note_id else f"{images_dir}/note_{idx+1}_{timestamp}"
-                tasks = []
+                os.makedirs(folder, exist_ok=True)
+
+                # 简单下载：直接使用URL下载，不更新Cookie（避免卡顿）
+                downloaded_count = 0
                 for i, url in enumerate(data['image_urls'], 1):
+                    if self.should_stop:
+                        break
                     ext = '.webp' if '.webp' in url else '.jpg'
-                    tasks.append((url, f"{folder}/img_{i}{ext}"))
-                
-                if tasks:
-                    results = self.downloader.download_batch(tasks, None, lambda: self.should_stop)
-                    # 存储绝对路径
-                    data['local_images'] = [os.path.abspath(r) for r in results.values() if r]
-                    data['image_count'] = len(data['local_images'])
-                    self.log(f"  下载成功 {data['image_count']}/{len(tasks)} 张图片", "SUCCESS" if data['image_count'] > 0 else "WARNING")
+                    filepath = f"{folder}/img_{i}{ext}"
+
+                    # 简单下载
+                    try:
+                        response = self.downloader.session.get(url, timeout=10, stream=True)
+                        response.raise_for_status()
+                        with open(filepath, 'wb') as f:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                        downloaded_count += 1
+                    except:
+                        pass
+
+                data['image_count'] = downloaded_count
+                self.log(f"  下载成功 {downloaded_count}/{len(data['image_urls'])} 张图片", "SUCCESS" if downloaded_count > 0 else "WARNING")
             elif note_type == "视频":
                 self.log(f"  视频类型跳过图片下载", "INFO")
-            elif not data['image_urls']:
-                self.log(f"  未获取到图片URL", "WARNING")
-            
+
             # 下载视频
             if self.config.download_videos and video_url:
                 self.log(f"  开始下载视频...", "INFO")
@@ -5035,6 +5142,7 @@ class CrawlerApp:
                     self.log(f"  视频下载失败", "WARNING")
             
             # 评论爬取（优化版）
+            self.log(f"  开始获取评论...", "DEBUG")
             if self.config.get_comments:
                 comments = self._extract_comments(page)
                 data['comments'] = comments
@@ -5073,9 +5181,10 @@ class CrawlerApp:
                         if comment_img_count > 0:
                             self.log(f"  评论图片: {comment_img_count}张 (保存到 comments 文件夹)", "INFO")
                             data['comment_images_count'] = comment_img_count
-            
+
+            self.log(f"  笔记数据提取完成，准备返回", "DEBUG")
             return data
-            
+
         except Exception as e:
             self.log(f"提取数据失败: {e}", "ERROR")
             return None
@@ -5402,7 +5511,84 @@ class CrawlerApp:
             return int(re.sub(r'[^\d]', '', text) or 0)
         except Exception:
             return 0
-    
+
+    def _close_note_popup(self, page) -> bool:
+        """关闭笔记详情弹窗（支持多种关闭方式）"""
+        try:
+            # 方法1: 点击关闭按钮（最可靠）
+            close_selectors = [
+                'css:.close-icon',                    # 关闭图标
+                'css:.note-detail-mask .close',       # 弹窗内的关闭按钮
+                'css:[class*="close"]',               # 任何包含close的元素
+                'css:.close-btn',                     # 关闭按钮
+            ]
+
+            for sel in close_selectors:
+                try:
+                    close_btn = page.ele(sel, timeout=0.3)
+                    if close_btn:
+                        close_btn.click()
+                        time.sleep(0.3)
+                        # 验证弹窗是否关闭
+                        if not page.ele('css:.note-detail-mask, .note-container', timeout=0.5):
+                            self.log("  [关闭弹窗] 点击关闭按钮成功", "DEBUG")
+                            return True
+                except Exception:
+                    continue
+
+            # 方法2: 按ESC键
+            try:
+                page.actions.key_down('Escape').key_up('Escape')
+                time.sleep(0.3)
+                if not page.ele('css:.note-detail-mask, .note-container', timeout=0.5):
+                    self.log("  [关闭弹窗] ESC键成功", "DEBUG")
+                    return True
+            except Exception:
+                pass
+
+            # 方法3: 点击遮罩层（弹窗背景）
+            try:
+                mask = page.ele('css:.note-detail-mask, .modal-mask', timeout=0.3)
+                if mask:
+                    mask.click()
+                    time.sleep(0.3)
+                    if not page.ele('css:.note-detail-mask, .note-container', timeout=0.5):
+                        self.log("  [关闭弹窗] 点击遮罩成功", "DEBUG")
+                        return True
+            except Exception:
+                pass
+
+            # 方法4: JavaScript强制关闭（最后手段）
+            try:
+                result = page.run_js("""
+                    // 移除弹窗元素
+                    const masks = document.querySelectorAll('.note-detail-mask, .modal-mask');
+                    for (let mask of masks) {
+                        mask.remove();
+                    }
+                    // 移除弹窗容器
+                    const containers = document.querySelectorAll('.note-container, [class*="noteContainer"]');
+                    for (let container of containers) {
+                        if (container.style.position === 'fixed' || container.style.position === 'absolute') {
+                            container.remove();
+                        }
+                    }
+                    return true;
+                """)
+                if result:
+                    time.sleep(0.3)
+                    self.log("  [关闭弹窗] JS强制关闭", "DEBUG")
+                    return True
+            except Exception:
+                pass
+
+            self.log("  [关闭弹窗] 失败，可能已关闭", "WARNING")
+            return False
+
+        except Exception as e:
+            self.log(f"  [关闭弹窗] 异常: {e}", "WARNING")
+            return False
+
     def _save_data(self, data, keyword):
         """保存数据"""
         os.makedirs("data", exist_ok=True)
