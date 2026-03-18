@@ -139,66 +139,70 @@ class CrawlerExecutor:
 
     def __init__(self):
         self.crawler_dir = PROJECT_DIR
+        self.executor = task_manager.executor
 
     def run_crawl(self, task_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        """执行爬取任务"""
+        """执行爬取任务（使用 subprocess 调用现有爬虫）"""
         logger.info(f"[{task_id}] 开始爬取: {params}")
+
+        import subprocess
 
         try:
             task_manager.update_task(task_id, status="running", progress=0, message="初始化爬虫...")
 
-            # 导入爬虫模块
-            from crawler_ultimate import XiaohongshuCrawler, CrawlerConfig
+            keyword = params.get('keyword', '')
+            count = params.get('count', 10)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-            # 创建配置
-            config = CrawlerConfig(
-                keyword=params.get('keyword', ''),
-                max_notes=params.get('count', 10),
-                crawl_mode=params.get('mode', 'standard'),
-                crawl_type=params.get('crawl_type', 'keyword'),
-                blogger_url=params.get('blogger_url', ''),
-                download_images=params.get('download_images', True),
-                download_videos=params.get('download_videos', True),
+            # 使用 subprocess 调用爬虫（CLI 模式）
+            task_manager.update_task(task_id, progress=10, message="启动爬虫进程...")
+
+            cmd = [
+                'python3', str(PROJECT_DIR / 'cli_crawler.py'),
+                '--keyword', keyword,
+                '--count', str(count),
+                '--output-dir', str(OUTPUT_DIR)
+            ]
+
+            logger.info(f"执行命令: {' '.join(cmd)}")
+
+            # 执行爬虫（超时 10 分钟）
+            result = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_DIR),
+                capture_output=True,
+                text=True,
+                timeout=600
             )
 
-            # 创建爬虫实例
-            crawler = XiaohongshuCrawler(config)
+            if result.returncode != 0:
+                error_msg = result.stderr or result.stdout or "未知错误"
+                raise Exception(f"爬虫执行失败: {error_msg[:200]}")
 
-            # 设置进度回调
-            def progress_callback(current, total, message):
-                progress = int((current / total) * 100) if total > 0 else 0
-                task_manager.update_task(task_id, progress=progress, message=message)
-                logger.info(f"[{task_id}] 进度: {progress}% - {message}")
+            task_manager.update_task(task_id, progress=90, message="整理结果...")
 
-            crawler.progress_callback = progress_callback
-
-            # 执行爬取
-            task_manager.update_task(task_id, message="正在爬取...")
-            results = crawler.run()
-
-            if not results:
-                raise Exception("爬取失败，未获取到数据")
-
-            # 导出结果
-            task_manager.update_task(task_id, progress=80, message="正在导出数据...")
-
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            keyword = params.get('keyword', 'unknown')
-
-            # 导出 Excel
-            excel_filename = f"result_{keyword}_{timestamp}.xlsx"
-            excel_path = OUTPUT_DIR / excel_filename
-            crawler.export_to_excel(str(excel_path))
+            # 查找结果文件
+            excel_file = self._find_latest_result(keyword)
+            if not excel_file:
+                raise Exception("未找到结果文件")
 
             # 收集媒体文件
             media_files = self._collect_media_files(keyword, timestamp)
+
+            # 获取记录数
+            try:
+                import pandas as pd
+                df = pd.read_excel(excel_file)
+                count = len(df)
+            except:
+                count = 0
 
             result = {
                 "success": True,
                 "task_id": task_id,
                 "keyword": keyword,
-                "count": len(results),
-                "excel_file": str(excel_path),
+                "count": count,
+                "excel_file": str(excel_file),
                 "images_dir": media_files["images_dir"],
                 "video_files": media_files["videos"],
                 "timestamp": timestamp
@@ -212,8 +216,18 @@ class CrawlerExecutor:
                 result=result
             )
 
-            logger.info(f"[{task_id}] 爬取完成: {len(results)} 条记录")
+            logger.info(f"[{task_id}] 爬取完成: {count} 条记录")
             return result
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"[{task_id}] 爬取超时")
+            task_manager.update_task(
+                task_id,
+                status="failed",
+                message="爬取超时（10分钟）",
+                error="timeout"
+            )
+            return {"success": False, "task_id": task_id, "error": "timeout"}
 
         except Exception as e:
             logger.error(f"[{task_id}] 爬取失败: {e}")
@@ -228,6 +242,16 @@ class CrawlerExecutor:
                 "task_id": task_id,
                 "error": str(e)
             }
+
+    def _find_latest_result(self, keyword: str) -> Optional[str]:
+        """查找最新的结果文件"""
+        files = list(OUTPUT_DIR.glob("result_*.xlsx"))
+        if files:
+            # 按修改时间排序，返回最新的
+            latest = max(files, key=lambda f: f.stat().st_mtime)
+            logger.info(f"找到结果文件: {latest}")
+            return str(latest)
+        return None
 
     def _collect_media_files(self, keyword: str, timestamp: str) -> Dict[str, Any]:
         """收集媒体文件"""
@@ -344,11 +368,12 @@ async def list_tasks():
 
 
 @app.post("/upload/feishu")
-async def upload_to_feishu(task_id: str):
+async def upload_to_feishu(task_id: str, upload_images: bool = True):
     """
     上传结果到飞书多维表格
 
     - **task_id**: 任务ID
+    - **upload_images**: 是否上传图片（默认 True）
     """
     task = task_manager.get_task(task_id)
 
@@ -367,21 +392,95 @@ async def upload_to_feishu(task_id: str):
         from feishu_uploader import FeishuUploader
 
         uploader = FeishuUploader()
+
+        # 1. 上传 Excel 数据到多维表格
         upload_result = uploader.upload_crawl_result(result)
+
+        # 2. 如果有图片，使用 feishu-upload 技能上传
+        image_urls = []
+        images_dir = result.get("images_dir", "")
+
+        if upload_images and images_dir and os.path.exists(images_dir):
+            logger.info(f"开始上传图片: {images_dir}")
+            image_urls = await _upload_images_to_feishu(images_dir)
+
+            # 将图片链接添加到上传结果
+            if image_urls:
+                upload_result["image_urls"] = image_urls
+                upload_result["images_uploaded"] = len(image_urls)
 
         # 更新任务结果
         task["result"]["feishu_uploaded"] = True
         task["result"]["feishu_url"] = upload_result.get("url")
+        task["result"]["image_urls"] = image_urls
 
         return {
             "success": True,
             "task_id": task_id,
-            "upload_result": upload_result
+            "upload_result": upload_result,
+            "images_uploaded": len(image_urls)
         }
 
     except Exception as e:
         logger.error(f"飞书上传失败: {e}")
         raise HTTPException(status_code=500, detail=f"上传失败: {str(e)}")
+
+
+async def _upload_images_to_feishu(images_dir: str) -> List[str]:
+    """
+    使用 feishu-upload 技能上传图片
+
+    Args:
+        images_dir: 图片目录路径
+
+    Returns:
+        图片 URL 列表
+    """
+    import subprocess
+    from pathlib import Path
+
+    upload_script = Path.home() / ".openclaw/workspace/skills/feishu-upload/scripts/upload.py"
+
+    if not upload_script.exists():
+        logger.warning(f"上传脚本不存在: {upload_script}")
+        return []
+
+    # 查找所有图片
+    image_files = list(Path(images_dir).rglob("*.jpg"))
+    image_files.extend(Path(images_dir).rglob("*.png"))
+    image_files.extend(Path(images_dir).rglob("*.jpeg"))
+
+    if not image_files:
+        logger.info("没有找到图片文件")
+        return []
+
+    # 限制上传数量（最多 20 张）
+    image_files = image_files[:20]
+
+    logger.info(f"准备上传 {len(image_files)} 张图片")
+
+    try:
+        # 调用上传脚本
+        result = subprocess.run(
+            ["python3", str(upload_script)] + [str(f) for f in image_files] + ["--output", "json"],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+
+        if result.returncode == 0:
+            import json
+            output = json.loads(result.stdout)
+            urls = output.get("urls", [])
+            logger.info(f"图片上传成功: {len(urls)} 张")
+            return urls
+        else:
+            logger.warning(f"图片上传失败: {result.stderr}")
+            return []
+
+    except Exception as e:
+        logger.error(f"图片上传异常: {e}")
+        return []
 
 
 # ============== 主程序 ==============

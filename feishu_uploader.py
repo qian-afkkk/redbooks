@@ -195,13 +195,13 @@ class FeishuUploader:
             创建结果
         """
         token = self.get_access_token()
-        bitable_id = self.config.get("bitable_id")
+        app_token = self.config.get("app_token")
         table_id = self.config.get("table_id")
 
-        if not bitable_id or not table_id:
-            raise ValueError("未配置 bitable_id 或 table_id")
+        if not app_token or not table_id:
+            raise ValueError("未配置 app_token 或 table_id")
 
-        url = f"{self.BASE_URL}/bitable/v1/apps/{bitable_id}/tables/{table_id}/records"
+        url = f"{self.BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/records"
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
