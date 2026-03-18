@@ -5201,6 +5201,8 @@ class CrawlerApp:
                 data['comments'] = comments
                 if comments:
                     self.log(f"  获取到 {len(comments)} 条评论", "INFO")
+                else:
+                    self.log(f"  未获取到评论，可能是笔记没有评论或页面结构已变化", "WARNING")
                     
                     # 下载评论图片到单独的 comments 文件夹
                     comment_images_urls = []
@@ -5244,23 +5246,34 @@ class CrawlerApp:
     
     def _extract_single_comment(self, item, existing_contents: set) -> Optional[Dict]:
         """提取单条评论的完整信息"""
-        exclude_words = {'关注', '点赞', '收藏', '分享', '复制', '举报', '回复', '查看', '展开', '赞', '条评论', '说点什么', '取消', '发送'}
-        
+        exclude_words = {'关注', '点赞', '收藏', '分享', '复制', '举报', '回复', '查看', '展开', '赞', '条评论', '说点什么', '取消', '发送', '展开更多', '收起'}
+
         try:
-            # 获取评论者名字
-            name_el = item.ele('css:.name, .user-name, .author-name, .nickname', timeout=0.1)
+            # 获取评论者名字 - 扩展选择器
+            name_el = item.ele('css:.name, .user-name, .author-name, .nickname, [class*="user"] [class*="name"], [class*="author"]', timeout=0.2)
             name = (name_el.text if name_el else "").strip()
-            
-            # 获取评论内容
-            content_el = item.ele('css:.content, .comment-content, .note-text', timeout=0.1)
+
+            # 获取评论内容 - 扩展选择器
+            content_el = item.ele('css:.content, .comment-content, .note-text, [class*="comment"] [class*="text"], [class*="comment"] [class*="content"], p', timeout=0.2)
             content = (content_el.text if content_el else "").strip()
-            
-            # 过滤无效评论
-            if not content or len(content) <= 3 or len(content) >= 500:
+
+            # 过滤无效评论 - 放宽条件，添加日志
+            if not content:
+                return None
+            if len(content) < 1:  # 允许任意长度（原<=3改为<1）
+                self.log(f"  [评论过滤] 过短: '{content[:20]}'", "DEBUG")
+                return None
+            if len(content) >= 500:  # 上限保持500
+                self.log(f"  [评论过滤] 过长: {len(content)}字符", "DEBUG")
                 return None
             if content in existing_contents:
+                self.log(f"  [评论过滤] 重复: '{content[:20]}'", "DEBUG")
                 return None
-            if content in exclude_words or content.isdigit():
+            if content in exclude_words:
+                self.log(f"  [评论过滤] 排除词: '{content}'", "DEBUG")
+                return None
+            if content.isdigit():
+                self.log(f"  [评论过滤] 纯数字: '{content}'", "DEBUG")
                 return None
             
             # 获取时间
@@ -5329,49 +5342,222 @@ class CrawlerApp:
             return None
     
     def _extract_comments(self, page) -> List[Dict]:
-        """提取评论内容（基于浏览器自动化分析的实际DOM结构）
+        """提取评论内容（支持JavaScript直接提取 + CSS选择器备用方案）
         返回包含评论者、内容、时间、IP、点赞数、图片标记的字典列表
         """
         comments = []
         max_count = self.config.comments_count
         existing_contents = set()
-        
+
+        self.log(f"  [评论提取] 开始提取评论，目标数量: {max_count}", "DEBUG")
+
+        # 步骤0: 先激活评论区 - 滚动到底部并等待评论加载
         try:
-            # 获取所有评论项
-            comment_items = page.eles('css:.comment-item, .parent-comment, .comment-inner', timeout=0.5)
-            
-            for item in comment_items:
-                if len(comments) >= max_count:
-                    break
-                
-                comment = self._extract_single_comment(item, existing_contents)
-                if comment:
-                    comments.append(comment)
-                    existing_contents.add(comment['content'])
-            
-            # 如果还没有足够的评论，尝试滚动评论区加载更多
-            if len(comments) < max_count:
+            # 尝试滚动到评论区区域
+            self.log(f"  [评论提取] 滚动到评论区等待加载...", "DEBUG")
+            page.scroll.to_bottom()
+
+            # 尝试点击评论按钮/区域
+            comment_btn_selectors = [
+                '[class*="comment-btn"]',
+                '[class*="comment"] button',
+                '.note-detail-comments',
+                '.comments-title',
+            ]
+            for selector in comment_btn_selectors:
                 try:
-                    comments_container = page.ele('css:.comments-container, .comments-el, .note-scroller', timeout=0.3)
-                    if comments_container:
-                        comments_container.scroll.to_bottom()
-                        time.sleep(0.3)
-                        
-                        # 再次获取新加载的评论
-                        new_items = page.eles('css:.comment-item, .comment-inner', timeout=0.3)
-                        for item in new_items:
-                            if len(comments) >= max_count:
-                                break
-                            comment = self._extract_single_comment(item, existing_contents)
-                            if comment:
-                                comments.append(comment)
-                                existing_contents.add(comment['content'])
+                    btn = page.ele(f'css:{selector}', timeout=0.5)
+                    if btn:
+                        btn.click()
+                        self.log(f"  [评论提取] 已点击评论按钮", "DEBUG")
+                        time.sleep(0.5)
+                        break
                 except Exception:
                     pass
-                    
-        except Exception:
-            pass
-        
+
+            # 等待评论加载
+            time.sleep(1.0)
+        except Exception as e:
+            self.log(f"  [评论提取] 激活评论区失败: {e}", "DEBUG")
+
+        # 方案1: 使用JavaScript直接从页面状态提取（更可靠）
+        js_extracted = self._extract_comments_by_js(page, max_count)
+        if js_extracted:
+            self.log(f"  [评论提取] JS提取到 {len(js_extracted)} 条评论", "INFO")
+            for c in js_extracted:
+                comments.append(c)
+                existing_contents.add(c['content'])
+
+        # 方案2: 如果JS提取不足，使用CSS选择器备用方案
+        if len(comments) < max_count:
+            self.log(f"  [评论提取] CSS选择器补充提取", "DEBUG")
+
+            # 多组备用CSS选择器，覆盖可能的DOM结构变化
+            css_selectors = [
+                '.comment-item, .parent-comment, .comment-inner',  # 原有选择器
+                '[class*="comment"], [class*="Comment"]',  # 通用comment类名
+                '.note-comment-item, .comment-list-item, .reply-item',  # 其他可能类名
+                '.comments-section [class*="item"]',  # 评论区下的item
+            ]
+
+            for selector in css_selectors:
+                try:
+                    comment_items = page.eles(f'css:{selector}', timeout=0.3)
+                    self.log(f"  [评论提取] 选择器 '{selector}' 找到 {len(comment_items)} 个元素", "DEBUG")
+
+                    for item in comment_items:
+                        if len(comments) >= max_count:
+                            break
+
+                        comment = self._extract_single_comment(item, existing_contents)
+                        if comment:
+                            comments.append(comment)
+                            existing_contents.add(comment['content'])
+                            self.log(f"  [评论提取] 成功提取评论: {comment['content'][:20]}...", "DEBUG")
+
+                    if len(comments) >= max_count:
+                        break
+                except Exception as e:
+                    self.log(f"  [评论提取] 选择器 '{selector}' 失败: {e}", "DEBUG")
+
+            # 尝试滚动加载更多评论
+            if len(comments) < max_count:
+                self.log(f"  [评论提取] 尝试滚动加载更多评论", "DEBUG")
+                try:
+                    comments_container = page.ele('css:.comments-container, .comments-el, .note-scroller, [class*="comment"]', timeout=0.3)
+                    if comments_container:
+                        comments_container.scroll.to_bottom()
+                        time.sleep(0.5)
+
+                        # 再次尝试提取
+                        for selector in css_selectors:
+                            try:
+                                new_items = page.eles(f'css:{selector}', timeout=0.3)
+                                for item in new_items:
+                                    if len(comments) >= max_count:
+                                        break
+                                    comment = self._extract_single_comment(item, existing_contents)
+                                    if comment:
+                                        comments.append(comment)
+                                        existing_contents.add(comment['content'])
+                            except Exception:
+                                pass
+                except Exception as e:
+                    self.log(f"  [评论提取] 滚动加载失败: {e}", "DEBUG")
+
+        self.log(f"  [评论提取] 最终提取到 {len(comments)} 条评论", "INFO")
+        return comments
+
+    def _extract_comments_by_js(self, page, max_count: int) -> List[Dict]:
+        """使用JavaScript直接从页面状态中提取评论数据"""
+        comments = []
+
+        try:
+            # 尝试从window对象获取评论数据
+            js_code = '''
+            (() => {
+                try {
+                    // 方案1: 从 __INITIAL_STATE__ 获取
+                    if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.comment) {
+                        return JSON.stringify({source: 'INITIAL_STATE', data: window.__INITIAL_STATE__.comment});
+                    }
+
+                    // 方案2: 从 Redux store 获取
+                    if (window.__REDUX_STATE__ && window.__REDUX_STATE__.comment) {
+                        return JSON.stringify({source: 'REDUX_STATE', data: window.__REDUX_STATE__.comment});
+                    }
+
+                    // 方案3: 从 React DOM 属性获取
+                    const commentContainer = document.querySelector('[class*="comment"]') || document.querySelector('.comments-container');
+                    if (commentContainer && commentContainer._reactInternalInstance) {
+                        // 尝试从React实例获取props
+                        const props = commentContainer._reactInternalInstance.memoizedProps;
+                        if (props && props.comments) {
+                            return JSON.stringify({source: 'React', data: props.comments});
+                        }
+                    }
+
+                    // 方案4: 直接解析DOM中的评论数据
+                    const commentItems = document.querySelectorAll('[class*="comment-item"], [class*="CommentItem"], [class*="reply-item"]');
+                    const result = [];
+                    commentItems.forEach((item, idx) => {
+                        if (idx >= 50) return; // 限制数量
+
+                        // 提取用户名
+                        const nameEl = item.querySelector('[class*="name"], [class*="user"], [class*="author"]');
+                        const name = nameEl ? nameEl.textContent.trim() : '';
+
+                        // 提取评论内容
+                        const contentEl = item.querySelector('[class*="content"], [class*="text"], [class*="desc"]');
+                        const content = contentEl ? contentEl.textContent.trim() : '';
+
+                        // 提取时间
+                        const timeEl = item.querySelector('[class*="time"], [class*="date"]');
+                        const time = timeEl ? timeEl.textContent.trim() : '';
+
+                        // 提取点赞数
+                        const likeEl = item.querySelector('[class*="like"] [class*="count"], [class*="like-count"]');
+                        let likes = 0;
+                        if (likeEl) {
+                            const likeText = likeEl.textContent.trim();
+                            if (likeText.includes('万')) {
+                                likes = Math.floor(parseFloat(likeText.replace('万', '')) * 10000);
+                            } else if (!isNaN(parseInt(likeText))) {
+                                likes = parseInt(likeText);
+                            }
+                        }
+
+                        // 提取IP/地区
+                        const ipEl = item.querySelector('[class*="ip"], [class*="location"], [class*="region"]');
+                        const ip = ipEl ? ipEl.textContent.trim() : '';
+
+                        if (content && content.length > 0) {
+                            result.push({
+                                author: name || '匿名用户',
+                                content: content,
+                                time: time,
+                                ip: ip,
+                                likes: likes,
+                                has_image: false,
+                                images: []
+                            });
+                        }
+                    });
+
+                    if (result.length > 0) {
+                        return JSON.stringify({source: 'DOM_Parser', data: result});
+                    }
+
+                    return JSON.stringify({source: 'none', data: []});
+                } catch (e) {
+                    return JSON.stringify({source: 'error', error: String(e)});
+                }
+            })()
+            '''
+
+            result = page.run_js(js_code)
+
+            if result:
+                import json
+                parsed = json.loads(result)
+
+                if parsed.get('source') == 'DOM_Parser' and parsed.get('data'):
+                    comments.extend(parsed['data'][:max_count])
+                elif parsed.get('data') and isinstance(parsed.get('data'), list):
+                    comments.extend(parsed['data'][:max_count])
+                elif parsed.get('data') and isinstance(parsed.get('data'), dict):
+                    # 处理可能的数据结构
+                    data = parsed['data']
+                    if isinstance(data, dict):
+                        # 尝试获取评论列表
+                        for key in ['comments', 'list', 'data', 'items', 'rows']:
+                            if key in data and isinstance(data[key], list):
+                                comments.extend(data[key][:max_count])
+                                break
+
+        except Exception as e:
+            self.log(f"  [评论提取] JS提取失败: {e}", "DEBUG")
+
         return comments
     
     def _filter_live_images(self, image_urls: list) -> list:
