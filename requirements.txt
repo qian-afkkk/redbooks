@@ -13,3 +13,8 @@ customtkinter>=5.2.0
 # 可选依赖（数据分析功能）
 # 如需使用图表、词云、报告功能，请安装：
 # pip install matplotlib wordcloud jieba python-docx
+
+# API 服务依赖（OpenClaw 集成）
+fastapi>=0.100.0
+uvicorn>=0.23.0
+pydantic>=2.0.0
