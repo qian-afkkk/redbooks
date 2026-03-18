@@ -53,14 +53,29 @@ for dir_path in [DATA_DIR, IMAGES_DIR, OUTPUT_DIR]:
 # ============== 请求模型 ==============
 
 class CrawlRequest(BaseModel):
-    """爬取请求模型"""
-    keyword: str = Field(..., description="搜索关键词")
-    count: int = Field(10, ge=1, le=100, description="爬取数量")
-    mode: str = Field("standard", description="爬取模式: standard/fast")
+    """爬取请求模型 - 支持所有 GUI 功能"""
+    # 基础参数
+    keyword: str = Field("", description="搜索关键词（为空表示主页推荐）")
+    count: int = Field(10, ge=1, le=500, description="爬取数量")
+    mode: str = Field("standard", description="爬取模式: standard/fast/turbo")
     crawl_type: str = Field("keyword", description="爬取类型: keyword/blogger/hot")
-    blogger_url: Optional[str] = Field(None, description="博主主页URL")
+    blogger_url: Optional[str] = Field(None, description="博主主页URL（blogger模式必填）")
+
+    # 内容选项
     download_images: bool = Field(True, description="是否下载图片")
     download_videos: bool = Field(True, description="是否下载视频")
+    get_comments: bool = Field(True, description="是否获取评论")
+    comments_count: int = Field(20, ge=0, le=100, description="评论数量")
+
+    # 筛选条件
+    min_likes: int = Field(0, ge=0, description="最小点赞数筛选")
+    max_likes: int = Field(999999, ge=0, description="最大点赞数筛选")
+    note_type: str = Field("全部", description="笔记类型: 全部/图文/视频")
+    date_filter: str = Field("全部", description="日期筛选")
+
+    # 速度控制
+    scroll_times: int = Field(10, ge=1, le=50, description="滚动次数")
+
     task_id: Optional[str] = Field(None, description="任务ID（可选）")
 
     class Config:
@@ -69,7 +84,8 @@ class CrawlRequest(BaseModel):
                 "keyword": "护肤品",
                 "count": 10,
                 "mode": "standard",
-                "crawl_type": "keyword"
+                "min_likes": 100,
+                "note_type": "视频"
             }
         }
 
@@ -157,12 +173,31 @@ class CrawlerExecutor:
             # 使用 subprocess 调用爬虫（CLI 模式）
             task_manager.update_task(task_id, progress=10, message="启动爬虫进程...")
 
+            # 构建命令（支持所有参数）
             cmd = [
                 'python3', str(PROJECT_DIR / 'cli_crawler.py'),
                 '--keyword', keyword,
                 '--count', str(count),
-                '--output-dir', str(OUTPUT_DIR)
+                '--output-dir', str(OUTPUT_DIR),
+                '--mode', params.get('mode', 'standard'),
+                '--crawl-type', params.get('crawl_type', 'keyword'),
+                '--min-likes', str(params.get('min_likes', 0)),
+                '--max-likes', str(params.get('max_likes', 999999)),
+                '--note-type', params.get('note_type', '全部'),
+                '--scroll-times', str(params.get('scroll_times', 10)),
             ]
+
+            # 添加可选参数
+            if params.get('blogger_url'):
+                cmd.extend(['--blogger-url', params['blogger_url']])
+            if not params.get('download_images', True):
+                cmd.append('--no-images')
+            if not params.get('download_videos', True):
+                cmd.append('--no-videos')
+            if not params.get('get_comments', True):
+                cmd.append('--no-comments')
+            if params.get('comments_count', 20) != 20:
+                cmd.extend(['--comments-count', str(params['comments_count'])])
 
             logger.info(f"执行命令: {' '.join(cmd)}")
 

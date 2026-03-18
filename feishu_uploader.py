@@ -318,36 +318,38 @@ class FeishuUploader:
         Returns:
             飞书记录格式
         """
-        # 基本字段映射
+        # 基本字段映射（与飞书多维表格字段完全对应）
         fields = {}
 
-        # 文本字段
+        # 文本字段映射
         field_mapping = {
+            "note_id": "笔记ID",
             "title": "标题",
             "author": "作者",
             "content": "正文",
             "tags": "标签",
             "publish_time": "发布时间",
             "ip_region": "IP地区",
-            "note_type": "类型",
-            "note_link": "链接"
+            "note_type": "笔记类型",
+            "note_link": "笔记的链接"
         }
 
         for key, label in field_mapping.items():
-            if key in row_data and row_data[key]:
+            if key in row_data and row_data[key] is not None:
                 fields[label] = row_data[key]
 
         # 数值字段
-        if "like_count" in row_data:
-            fields["点赞数"] = row_data["like_count"]
-        if "collect_count" in row_data:
-            fields["收藏数"] = row_data["collect_count"]
-        if "comment_count" in row_data:
-            fields["评论数"] = row_data["comment_count"]
+        if "like_count" in row_data and row_data["like_count"] is not None:
+            fields["点赞数"] = int(row_data["like_count"])
+        if "collect_count" in row_data and row_data["collect_count"] is not None:
+            fields["收藏数"] = int(row_data["collect_count"])
+        if "comment_count" in row_data and row_data["comment_count"] is not None:
+            fields["评论数"] = int(row_data["comment_count"])
 
         # 添加元数据
-        fields["爬取关键词"] = crawl_result.get("keyword", "")
-        fields["爬取时间"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        fields["来源关键词"] = crawl_result.get("keyword", "")
+        # 飞书时间字段需要 Unix 时间戳（毫秒）
+        fields["爬取时间"] = int(datetime.now().timestamp() * 1000)
 
         return {"fields": fields}
 
