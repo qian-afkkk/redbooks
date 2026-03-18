@@ -784,34 +784,46 @@ class DataAnalyzer:
 
 
 class CrawlerApp:
-    """爬虫GUI应用"""
-    
-    def __init__(self):
-        # 使用CustomTkinter创建现代化窗口
-        if HAS_CTK:
-            self.root = ctk.CTk()
-            self.root.configure(fg_color="#f5f5f5")
+    """爬虫GUI应用（支持CLI和GUI模式）"""
+
+    def __init__(self, headless=False):
+        """初始化应用
+
+        Args:
+            headless: CLI模式，不创建GUI界面
+        """
+        self.headless = headless
+
+        # 只在GUI模式下创建窗口
+        if not headless:
+            # 使用CustomTkinter创建现代化窗口
+            if HAS_CTK:
+                self.root = ctk.CTk()
+                self.root.configure(fg_color="#f5f5f5")
+            else:
+                self.root = tk.Tk()
+
+            self.root.title(APP_NAME)
+            self.root.minsize(900, 650)
         else:
-            self.root = tk.Tk()
-        
-        self.root.title(APP_NAME)
-        self.root.minsize(900, 650)
-        
+            self.root = None
+
         self.config = CrawlerConfig()
         # 加载上次的配置
         self.config.load_from_file()
-        
-        # 窗口大小固定1000x700，位置根据保存恢复
-        win_x = self.config.window_x if self.config.window_x >= 0 else 100
-        win_y = self.config.window_y if self.config.window_y >= 0 else 100
-        
-        self.root.geometry(f"1000x700+{win_x}+{win_y}")
-        
+
+        # 只在GUI模式下设置窗口位置
+        if not headless:
+            # 窗口大小固定1000x700，位置根据保存恢复
+            win_x = self.config.window_x if self.config.window_x >= 0 else 100
+            win_y = self.config.window_y if self.config.window_y >= 0 else 100
+            self.root.geometry(f"1000x700+{win_x}+{win_y}")
+
         self.downloader = MediaDownloader()
         self.cookie_mgr = CookieManager(self.config.cookies_file)
         self.file_logger = FileLogger(self.config.log_file)
         self.db_mgr = DatabaseManager(self.config.db_path)
-        
+
         self.log_queue = queue.Queue()
         self.is_running = False
         self.should_stop = False
@@ -820,16 +832,18 @@ class CrawlerApp:
         self.batch_notes_data = []  # 批次笔记数据
         self.current_batch_folder = None  # 当前批次文件夹
         self.browser_page = None  # 保持浏览器实例，避免每次都重新登录
-        
-        self._setup_styles()
-        self._create_ui()
-        self._start_log_consumer()
-        
-        # 恢复上次的GUI设置
-        self._restore_gui_settings()
-        
-        # 程序退出时关闭浏览器并保存配置
-        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+
+        # 只在GUI模式下设置样式和创建UI
+        if not headless:
+            self._setup_styles()
+            self._create_ui()
+            self._start_log_consumer()
+
+            # 恢复上次的GUI设置
+            self._restore_gui_settings()
+
+            # 程序退出时关闭浏览器并保存配置
+            self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
     
     def _setup_styles(self):
         """设置样式主题"""
@@ -3444,11 +3458,34 @@ class CrawlerApp:
     
     # === 日志 ===
     def log(self, message, level="INFO"):
+        """线程安全的日志输出（支持 headless 模式）"""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_queue.put((f"[{timestamp}] {message}\n", level))
-        
+
+        # CLI 模式下直接输出到控制台
+        if self.headless:
+            level_symbols = {
+                "INFO": "",
+                "SUCCESS": "✅",
+                "WARNING": "⚠️",
+                "ERROR": "❌"
+            }
+            symbol = level_symbols.get(level, "")
+            print(f"[{timestamp}] {symbol} {message}")
+
+        # GUI 模式下使用队列
+        if not self.headless:
+            self.log_queue.put((f"[{timestamp}] {message}\n", level))
+
         if self.config.log_to_file:
             self.file_logger.log(message, level)
+
+    def _safe_gui_callback(self, callback):
+        """安全的 GUI 回调（headless 模式下跳过）"""
+        if not self.headless and self.root:
+            try:
+                self.root.after(0, callback)
+            except Exception:
+                pass
     
     def _start_log_consumer(self):
         def consume():
@@ -3473,6 +3510,9 @@ class CrawlerApp:
         self.root.after(100, consume)
     
     def _update_ui(self, **kwargs):
+        """更新界面状态（headless 模式下跳过）"""
+        if self.headless:
+            return
         if "status" in kwargs:
             self.status_var.set(kwargs["status"])
         if "notes" in kwargs:
@@ -3638,34 +3678,36 @@ class CrawlerApp:
         self.is_running = True
         self.should_stop = False
         self.all_notes_data = []
-        
-        # 清空表格UI
-        for item in self.result_tree.get_children():
-            self.result_tree.delete(item)
-        self.result_count_label.config(text="共 0 条记录")
-        
-        # 清空预览区域
-        self.preview_canvas.delete("all")
-        self.preview_images = []
-        self.preview_image_paths = []
-        self.current_video_path = None
-        self.current_selected_note = None
-        
-        # 清空详情区域
-        self.detail_text.config(state=tk.NORMAL)
-        self.detail_text.delete(1.0, tk.END)
-        self.detail_text.config(state=tk.DISABLED)
-        
+
+        # 只在GUI模式下清空UI元素
+        if not self.headless:
+            # 清空表格UI
+            for item in self.result_tree.get_children():
+                self.result_tree.delete(item)
+            self.result_count_label.config(text="共 0 条记录")
+
+            # 清空预览区域
+            self.preview_canvas.delete("all")
+            self.preview_images = []
+            self.preview_image_paths = []
+            self.current_video_path = None
+            self.current_selected_note = None
+
+            # 清空详情区域
+            self.detail_text.config(state=tk.NORMAL)
+            self.detail_text.delete(1.0, tk.END)
+            self.detail_text.config(state=tk.DISABLED)
+
+            # 确保数据源是"当前爬取"
+            self.data_source_var.set("当前爬取")
+
+            self.start_btn.configure(state=tk.DISABLED)
+            self.stop_btn.configure(state=tk.NORMAL)
+
         # 清空批次数据
         self.batch_notes_data = []
         self.current_batch_folder = None
-        
-        # 确保数据源是"当前爬取"
-        self.data_source_var.set("当前爬取")
-        
-        self.start_btn.configure(state=tk.DISABLED)
-        self.stop_btn.configure(state=tk.NORMAL)
-        
+
         thread = threading.Thread(target=self._crawl_thread, daemon=True)
         thread.start()
     
@@ -3874,23 +3916,24 @@ class CrawlerApp:
                         save_name = "多关键词"
                     filename = self._save_data(self.all_notes_data, save_name)
                     self.log(f"数据已保存: {filename}", "SUCCESS")
-                    
-                    # 更新仪表盘
-                    df = pd.DataFrame(self.all_notes_data)
-                    stats = DataAnalyzer.generate_stats(df)
-                    self.root.after(0, lambda s=stats: self._update_dashboard(s))
+
+                    # 更新仪表盘（仅 GUI 模式）
+                    if not self.headless:
+                        df = pd.DataFrame(self.all_notes_data)
+                        stats = DataAnalyzer.generate_stats(df)
+                        self._safe_gui_callback(lambda s=stats: self._update_dashboard(s))
                 except Exception as e:
                     self.log(f"保存数据失败: {e}", "ERROR")
-            
+
             # 保存Cookie
             if page and self.config.save_cookies:
                 try:
                     if self.cookie_mgr.save(page):
                         self.log("Cookie已保存，下次可自动登录", "SUCCESS")
-                        self.root.after(0, self._check_cookie_status)
+                        self._safe_gui_callback(self._check_cookie_status)
                 except Exception:
                     pass
-            
+
             elapsed = int(time.time() - start_time)
             status = "已停止" if self.should_stop else "完成"
             self._update_ui(
@@ -3901,16 +3944,16 @@ class CrawlerApp:
                 time=f"用时: {elapsed}秒",
                 progress=100
             )
-            
+
             # 显示下载统计
             dl_stats = self.downloader.get_stats()
             if dl_stats['success'] > 0:
                 mb = dl_stats['bytes'] / (1024 * 1024)
                 self.log(f"下载统计: 成功 {dl_stats['success']}, 失败 {dl_stats['failed']}, 总计 {mb:.1f}MB", "INFO")
-            
+
             self.log(f"爬取{status}！笔记: {total_notes}, 图片: {total_images}, 视频: {total_videos}", "SUCCESS")
-            self.root.after(0, self._refresh_history)
-            
+            self._safe_gui_callback(self._refresh_history)
+
         except InterruptedError:
             self.log("爬取已取消", "WARNING")
         except Exception as e:
@@ -3920,14 +3963,16 @@ class CrawlerApp:
         finally:
             # 不关闭浏览器，保持登录状态
             # 浏览器会在程序退出时关闭
-            
+
             # 重置下载器状态
             self.downloader.close()
             self.downloader.reset_stats()
-            
+
             self.is_running = False
-            self.root.after(0, lambda: self.start_btn.configure(state=tk.NORMAL))
-            self.root.after(0, lambda: self.stop_btn.configure(state=tk.DISABLED))
+            # 恢复按钮状态（仅 GUI 模式）
+            if not self.headless:
+                self._safe_gui_callback(lambda: self.start_btn.configure(state=tk.NORMAL))
+                self._safe_gui_callback(lambda: self.stop_btn.configure(state=tk.DISABLED))
     
     def _sync_browser_cookies(self, page):
         """将浏览器Cookie同步到下载器"""
@@ -4009,36 +4054,42 @@ class CrawlerApp:
             return False
     
     def _wait_for_login(self, page):
-        """等待登录"""
+        """等待登录（支持 CLI 和 GUI 模式）"""
         self.log("请在浏览器中完成登录", "WARNING")
         self._update_ui(status="等待登录...")
-        
-        login_event = threading.Event()
-        cancelled = [False]
-        
-        def show_dialog():
-            result = messagebox.askokcancel(
-                "等待登录",
-                "请在浏览器中完成登录\n\n登录完成后点击【确定】\n点击【取消】停止爬取"
-            )
-            if not result:
-                cancelled[0] = True
-                self.should_stop = True
-            login_event.set()
-        
-        self.root.after(0, show_dialog)
-        login_event.wait()
-        
-        if cancelled[0]:
-            raise InterruptedError("用户取消")
-        
+
+        if self.headless:
+            # CLI 模式：等待用户在控制台输入
+            self.log("登录完成后请按 Enter 键继续...", "INFO")
+            input()  # 等待用户按 Enter
+        else:
+            # GUI 模式：显示对话框
+            login_event = threading.Event()
+            cancelled = [False]
+
+            def show_dialog():
+                result = messagebox.askokcancel(
+                    "等待登录",
+                    "请在浏览器中完成登录\n\n登录完成后点击【确定】\n点击【取消】停止爬取"
+                )
+                if not result:
+                    cancelled[0] = True
+                    self.should_stop = True
+                login_event.set()
+
+            self._safe_gui_callback(show_dialog)
+            login_event.wait()
+
+            if cancelled[0]:
+                raise InterruptedError("用户取消")
+
         # 登录完成后立即保存Cookie
         if self.config.save_cookies:
             try:
                 time.sleep(1)  # 等待Cookie完全写入
                 if self.cookie_mgr.save(page):
                     self.log("Cookie已保存，下次可自动登录", "SUCCESS")
-                    self.root.after(0, self._check_cookie_status)
+                    self._safe_gui_callback(self._check_cookie_status)
             except Exception as e:
                 self.log(f"Cookie保存失败: {e}", "WARNING")
     
@@ -4293,9 +4344,11 @@ class CrawlerApp:
                         images += note_data.get('image_count', 0)
                         videos += 1 if note_data.get('video_url') else 0
                         consecutive_fails = 0
-                        
-                        self.root.after(0, lambda d=note_data, n=success: self._add_result_to_table(d, n-1))
-                        
+
+                        # 添加到表格（仅 GUI 模式）
+                        if not self.headless:
+                            self._safe_gui_callback(lambda d=note_data, n=success: self._add_result_to_table(d, n-1))
+
                         if self.config.export_to_db:
                             self.db_mgr.insert_note(note_data)
                         
@@ -5925,10 +5978,14 @@ class CrawlerApp:
             return
         self._force_close()
     
-    def _force_close(self):
-        """强制关闭程序"""
-        # 关闭浏览器
-        if self.browser_page:
+    def _force_close(self, close_browser=True):
+        """强制关闭程序
+
+        Args:
+            close_browser: 是否关闭浏览器（CLI模式下可设为False保持浏览器开启）
+        """
+        # 根据参数决定是否关闭浏览器
+        if close_browser and self.browser_page:
             try:
                 self.browser_page.quit()
             except Exception:
@@ -5939,12 +5996,115 @@ class CrawlerApp:
         except Exception:
             pass
         # 退出程序
-        self.root.destroy()
-    
+        if self.root:
+            self.root.destroy()
+
+    def run_cli_crawl(self, keyword, max_notes):
+        """CLI 模式爬取（无 GUI）
+
+        Args:
+            keyword: 搜索关键词，空字符串表示主页推荐
+            max_notes: 目标爬取笔记数量
+        """
+        # 设置配置
+        self.config.keyword = keyword
+        self.config.max_notes = max_notes
+        self.config.save_cookies = True  # 确保保存 cookies
+
+        display_keyword = keyword or "主页推荐"
+        print(f"🚀 开始爬取: {display_keyword}, 目标 {max_notes} 条")
+
+        # 启动爬取（复用现有爬取逻辑）
+        self._run_crawl()
+
+        # 等待爬取完成
+        while self.is_running:
+            time.sleep(0.5)
+
+        # 输出结果
+        crawl_dir = getattr(self, 'current_crawl_dir', '')
+        crawl_dir_abs = os.path.abspath(crawl_dir) if crawl_dir else "未找到"
+
+        # 查找生成的 Excel 文件
+        excel_path = "未找到"
+        try:
+            import glob
+            # 查找最近创建的 Excel 文件
+            data_dir = "data"
+            if os.path.exists(data_dir):
+                xlsx_files = glob.glob(os.path.join(data_dir, f"搜索结果_{display_keyword}_*.xlsx"))
+                if xlsx_files:
+                    # 按修改时间排序，取最新的
+                    excel_path = max(xlsx_files, key=os.path.getmtime)
+                    excel_path = os.path.abspath(excel_path)
+        except Exception:
+            pass
+
+        print(f"\n{'='*50}")
+        print(f"✅ 爬取完成！")
+        print(f"{'='*50}")
+        print(f"📊 共爬取: {len(self.all_notes_data)} 条笔记")
+        print(f"\n📄 Excel 文档:")
+        print(f"   位置: {excel_path}")
+        print(f"\n📁 图片/视频位置:")
+        print(f"   目录: {crawl_dir_abs}")
+        print(f"   结构: note_序号_时间戳/")
+        print(f"         ├── img_1.jpg, img_2.jpg ... (图片)")
+        print(f"         ├── video.mp4 (如有视频)")
+        print(f"         └── comments/ (评论图片)")
+        print(f"{'='*50}\n")
+
+        # 关闭 GUI（但不关闭浏览器）
+        if self.root is not None:
+            self.root.destroy()
+
     def run(self):
-        self.root.mainloop()
+        if self.root:
+            self.root.mainloop()
 
 
 if __name__ == '__main__':
-    app = CrawlerApp()
-    app.run()
+    import sys
+
+    # 帮助信息
+    if len(sys.argv) > 1 and sys.argv[1] in ('-h', '--help', 'help'):
+        print(f"""
+{APP_NAME} - CLI 模式使用说明
+
+用法:
+  python crawler_ultimate.py                    # GUI 模式（默认）
+  python crawler_ultimate.py 关键词 [数量]      # CLI 模式爬取关键词
+  python crawler_ultimate.py "" 数量            # CLI 模式爬取主页推荐
+
+参数:
+  关键词    搜索关键词，空字符串 "" 表示主页推荐
+  数量      目标爬取笔记数量，默认 30 条
+
+示例:
+  python crawler_ultimate.py 护肤品 10          # 爬取"护肤品"关键词，10条
+  python crawler_ultimate.py "" 20              # 爬取主页推荐，20条
+  python crawler_ultimate.py 美食               # 爬取"美食"关键词，30条（默认）
+
+注意:
+  - CLI 模式下爬取完成后浏览器会保持打开状态
+  - Excel 文件保存在 data/ 目录
+  - 图片/视频保存在 images/ 目录
+""")
+        sys.exit(0)
+
+    # 检查是否有命令行参数
+    if len(sys.argv) > 1:
+        # CLI 模式：直接执行爬取
+        # 支持两种调用方式：
+        #   python crawler_ultimate.py 关键词 数量
+        #   python crawler_ultimate.py "" 数量  (爬取主页推荐)
+        keyword = sys.argv[1] if sys.argv[1] != "主页推荐" else ""
+        max_notes = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+
+        # 创建应用实例但不显示 GUI
+        app = CrawlerApp(headless=True)
+        app.run_cli_crawl(keyword, max_notes)
+    else:
+        # GUI 模式：正常启动
+        app = CrawlerApp()
+        app.run()
