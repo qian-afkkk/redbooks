@@ -4059,9 +4059,23 @@ class CrawlerApp:
         self._update_ui(status="等待登录...")
 
         if self.headless:
-            # CLI 模式：等待用户在控制台输入
-            self.log("登录完成后请按 Enter 键继续...", "INFO")
-            input()  # 等待用户按 Enter
+            # CLI 模式：检测是否为非交互环境
+            import sys
+            is_non_interactive = not sys.stdin.isatty()
+
+            if is_non_interactive:
+                # 非交互模式：等待30秒，每2秒检查一次登录状态
+                self.log("非交互模式：等待30秒供您登录，每2秒检查一次...", "INFO")
+                for i in range(15):
+                    time.sleep(2)
+                    if self._check_login(page):
+                        self.log("检测到登录成功！", "SUCCESS")
+                        return
+                self.log("等待超时，继续尝试（可能需要手动在浏览器登录）", "WARNING")
+            else:
+                # 交互模式：等待用户在控制台输入
+                self.log("登录完成后请按 Enter 键继续...", "INFO")
+                input()  # 等待用户按 Enter
         else:
             # GUI 模式：显示对话框
             login_event = threading.Event()
@@ -4280,7 +4294,7 @@ class CrawlerApp:
                     
                     time.sleep(random.uniform(*self.config.click_delay))
                     
-                    # 等待弹窗内容加载
+                    # 等待弹窗内容加载（延长10倍）
                     popup_loaded = False
                     for _ in range(10):
                         try:
@@ -4289,8 +4303,8 @@ class CrawlerApp:
                                 break
                         except Exception:
                             pass
-                        time.sleep(0.2)
-                    
+                        time.sleep(2.0)  # 原来是0.2，延长10倍
+
                     # 额外等待互动数据和图片轮播加载
                     if popup_loaded:
                         # 等待互动数据
@@ -4300,8 +4314,8 @@ class CrawlerApp:
                                     break
                             except Exception:
                                 pass
-                            time.sleep(0.2)
-                        
+                            time.sleep(2.0)  # 原来是0.2，延长10倍
+
                         # 等待图片轮播加载（关键！）
                         for _ in range(5):
                             try:
@@ -4309,7 +4323,7 @@ class CrawlerApp:
                                     break
                             except Exception:
                                 pass
-                            time.sleep(0.3)
+                            time.sleep(3.0)  # 原来是0.3，延长10倍
                     
                     # 检查是否无法浏览
                     try:
@@ -4334,7 +4348,7 @@ class CrawlerApp:
                                 break
                     
                     # 提取数据
-                    time.sleep(0.5)  # 增加等待时间确保图片加载
+                    time.sleep(5.0)  # 延长10倍（原来是0.5），确保页面充分加载
                     note_data = self._extract_full_note(page, success, images_dir, timestamp, keyword)
                     crawled_urls.add(note_id)
                     
@@ -5091,53 +5105,69 @@ class CrawlerApp:
                 # 如果开启了获取全部图片，尝试切换轮播获取更多
                 if self.config.get_all_images and note_type != "视频":
                     self.log(f"  开始轮播切换获取更多图片...", "DEBUG")
+                    # 轮播前检查弹窗是否存在
+                    popup_before = page.ele('css:.note-detail-mask, .note-container', timeout=0.5)
+
                     # 尝试多种方式切换轮播
                     max_clicks = 15  # 最多点击15次
                     for click_idx in range(max_clicks):
                         if self.should_stop:
                             break
-                        
-                        # 尝试点击下一张按钮
+
+                        # 每次切换前检查弹窗是否还在
+                        if not page.ele('css:.note-detail-mask, .note-container', timeout=0.3):
+                            self.log(f"  轮播过程中弹窗被关闭，停止切换", "WARNING")
+                            break
+
+                        # 尝试点击下一张按钮（移除过于宽泛的选择器）
                         next_clicked = False
                         next_selectors = [
-                            'css:.next-btn',
                             'css:.swiper-button-next',
                             'css:.carousel-next',
-                            'css:[class*="next"]',
-                            'xpath://div[contains(@class, "arrow") and contains(@class, "right")]',
+                            'css:.note-detail-mask .next-btn',
                             'xpath://button[contains(@class, "next")]',
+                            'xpath://div[contains(@class, "arrow") and contains(@class, "right")]',
                         ]
-                        
+
                         for sel in next_selectors:
                             try:
                                 next_btn = page.ele(sel, timeout=0.2)
                                 if next_btn:
                                     next_btn.click()
                                     next_clicked = True
-                                    time.sleep(0.3)
+                                    time.sleep(0.5)  # 增加等待时间
                                     break
                             except:
                                 pass
-                        
+
                         # 如果没找到按钮，尝试用键盘右箭头
                         if not next_clicked:
                             try:
                                 page.actions.key_down('RIGHT').key_up('RIGHT')
-                                time.sleep(0.3)
+                                time.sleep(0.5)
                             except:
                                 pass
-                        
+
                         # 获取新图片
                         new_images = get_current_images()
                         old_count = len(preview_images)
                         for img in new_images:
                             if img not in preview_images:
                                 preview_images.append(img)
-                        
+
                         # 如果没有新图片，说明已经到最后一张
                         if len(preview_images) == old_count:
                             break
-                    
+
+                    # 轮播后检查弹窗状态
+                    popup_after = page.ele('css:.note-detail-mask, .note-container', timeout=0.3)
+                    if popup_before and not popup_after:
+                        self.log(f"  轮播后弹窗被关闭！尝试重新打开...", "WARNING")
+                        # 重新打开笔记页面
+                        if note_id:
+                            page.get(f'https://www.xiaohongshu.com/explore/{note_id}')
+                            time.sleep(3)
+
                     if len(preview_images) > 1:
                         self.log(f"  轮播获取到 {len(preview_images)} 张图片", "INFO")
                 
@@ -5193,7 +5223,11 @@ class CrawlerApp:
                     self.log(f"  视频下载成功: {file_size/1024/1024:.1f}MB", "SUCCESS")
                 else:
                     self.log(f"  视频下载失败", "WARNING")
-            
+
+            # 图片/视频下载完成后，等待页面稳定再提取评论
+            self.log(f"  等待页面稳定后提取评论...", "DEBUG")
+            time.sleep(3.0)
+
             # 评论爬取（优化版）
             self.log(f"  开始获取评论...", "DEBUG")
             if self.config.get_comments:
@@ -5363,20 +5397,50 @@ class CrawlerApp:
                 '[class*="comment"] button',
                 '.note-detail-comments',
                 '.comments-title',
+                '.comment-bar',  # 新增
+                '.engage-bar',   # 新增
+                '[class*="comment-count"]',  # 新增 - 点击评论数
             ]
             for selector in comment_btn_selectors:
                 try:
                     btn = page.ele(f'css:{selector}', timeout=0.5)
                     if btn:
                         btn.click()
-                        self.log(f"  [评论提取] 已点击评论按钮", "DEBUG")
+                        self.log(f"  [评论提取] 已点击评论按钮 ({selector})", "DEBUG")
                         time.sleep(0.5)
                         break
                 except Exception:
                     pass
 
-            # 等待评论加载
-            time.sleep(1.0)
+            # 等待评论加载 - 增加等待时间
+            time.sleep(2.0)
+
+            # 检测评论区是否已加载（新增检测和重试机制）
+            comment_loaded = False
+            for attempt in range(3):
+                # 尝试查找评论元素
+                test_items = page.eles('css:.comment-item, [class*="comment-item"]', timeout=0.3)
+                if test_items:
+                    comment_loaded = True
+                    self.log(f"  [评论提取] 检测到评论区已加载 (尝试 {attempt+1})", "DEBUG")
+                    break
+
+                # 未加载，等待后重试
+                if attempt < 2:
+                    self.log(f"  [评论提取] 评论区未加载，等待重试... (尝试 {attempt+1}/3)", "DEBUG")
+                    time.sleep(1.0)
+                    # 尝试点击评论数量按钮
+                    try:
+                        comment_count_btn = page.ele('css:[class*="count"], [class*="comment-count"]', timeout=0.3)
+                        if comment_count_btn:
+                            comment_count_btn.click()
+                            time.sleep(0.5)
+                    except Exception:
+                        pass
+
+            if not comment_loaded:
+                self.log(f"  [评论提取] 评论区可能未正确加载", "WARNING")
+
         except Exception as e:
             self.log(f"  [评论提取] 激活评论区失败: {e}", "DEBUG")
 
